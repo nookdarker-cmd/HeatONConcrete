@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>UHI Explorer</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <style>
+    :root { --graph-w: clamp(320px, 42vw, 560px); }
+    html, body { margin: 0; height: 100%; font-family: system-ui, 'Noto Sans Thai', sans-serif; }
+    #map { position: absolute; inset: 0; }
+    .leaflet-bottom.leaflet-left { margin-bottom: 64px; }
+
+    #bar {
+      position: absolute; left: 0; right: 0; bottom: 0; z-index: 1100;
+      background: #fff; box-shadow: 0 -2px 8px rgba(0,0,0,.2);
+      padding: 8px 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+      min-height: 40px;
+    }
+    body.graph-open #bar { right: var(--graph-w); }
+    #bar label { font-size: 14px; display: flex; align-items: center; gap: 4px; }
+    #bar select, #bar button { font: inherit; font-size: 14px; padding: 4px 8px; }
+    #bar button { cursor: pointer; border: 1px solid #9ca3af; background: #f9fafb; border-radius: 6px; }
+    #bar button.active { background: #1f2937; color: #fff; border-color: #1f2937; }
+    #status { font-size: 13px; color: #4b5563; }
+
+    #graph {
+      position: absolute; right: 0; bottom: 0; z-index: 1101;
+      width: var(--graph-w); height: 340px; background: #fff;
+      box-shadow: 0 -2px 10px rgba(0,0,0,.25); border-radius: 10px 0 0 0;
+      display: none; flex-direction: column; padding: 8px 12px; box-sizing: border-box;
+    }
+    body.graph-open #graph { display: flex; }
+    #graphHead { display: flex; justify-content: space-between; align-items: center; }
+    #graphTitle { font-weight: 600; }
+    #graphClose { border: none; background: none; font-size: 18px; cursor: pointer; }
+    #graphSummary { font-size: 13px; color: #4b5563; margin: 2px 0 6px; }
+    #chartBox { flex: 1; min-height: 0; position: relative; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div id="bar">
+    <label>ปี <select id="year"></select></label>
+    <label>จังหวัด
+      <select id="province"><option value="">เลือกจังหวัด...</option></select>
+    </label>
+    <button id="btnPoly">✏️ วาดพื้นที่</button>
+    <button id="btnRect">▭ สี่เหลี่ยม</button>
+    <button id="btnClear">ล้าง</button>
+    <button id="btnGraph">📈 กราฟ</button>
+    <span id="status"></span>
+  </div>
+
+  <div id="graph">
+    <div id="graphHead">
+      <span id="graphTitle">กราฟ</span>
+      <button id="graphClose" title="ปิดกราฟ">✕</button>
+    </div>
+    <div id="graphSummary">คลิกแผนที่ วาดพื้นที่ หรือเลือกจังหวัดเพื่อดูกราฟ</div>
+    <div id="chartBox"><canvas id="chart"></canvas></div>
+  </div>
+
+<script>
+// ช่วงเวลาของกราฟ (ไม่เกิน 5 ปี) ถ้าจังหวัดใหญ่แล้วช้า/หมดเวลา ให้ลดช่วงลง
+const SERIES_START = '2023-01-01';
+const SERIES_END = '2025-12-31';
+
+// workaround บั๊กของ Leaflet.draw 1.0.4 (ReferenceError: type is not defined)
+window.type = '';
+
+// ---------- แผนที่ ----------
+const map = L.map('map').setView([13.7563, 100.5018], 10);
+map.attributionControl.setPosition('bottomleft');
+
+const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+  { attribution: '© OpenStreetMap', maxZoom: 19 }).addTo(map);
+const sat = L.tileLayer(
+  'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+  { attribution: 'Tiles © Esri', maxZoom: 19 });
+
+// ขวาบน: ปุ่มเลเยอร์
+const layerControl = L.control.layers(
+  { 'แผนที่ถนน': osm, 'ภาพดาวเทียม': sat }, {}).addTo(map);
+
+// ซ้ายบน (ใต้ปุ่ม +/−): ปุ่มตำแหน่งของฉัน
+const LocateControl = L.Control.extend({
+  options: { position: 'topleft' },
+  onAdd() {
+    const box = L.DomUtil.create('div', 'leaflet-bar');
+    const a = L.DomUtil.create('a', '', box);
+    a.href = '#';
+    a.title = 'ตำแหน่งของฉัน';
+    a.innerHTML = '➤';
+    L.DomEvent.disableClickPropagation(box);
+    L.DomEvent.on(a, 'click', e => {
+      L.DomEvent.preventDefault(e);
+      map.locate({ setView: true, maxZoom: 12 });
+    });
+    return box;
+  }
+});
+map.addControl(new LocateControl());
+map.on('locationerror', () => setStatus('ระบุตำแหน่งไม่ได้ (ตรวจสิทธิ์ตำแหน่งในเบราว์เซอร์)'));
+
+// ---------- ตัวแปรหลัก ----------
+const yearSel = document.getElementById('year');
+const provSel = document.getElementById('province');
+const statusEl = document.getElementById('status');
+const graphTitle = document.getElementById('graphTitle');
+const graphSummary = document.getElementById('graphSummary');
+const btnGraph = document.getElementById('btnGraph');
+
+let lstLayer, ndviLayer;
+let focus = null;        // เลเยอร์โฟกัสปัจจุบัน (จุด / พื้นที่ที่วาด / จังหวัด)
+let chart = null;
+let reqId = 0;           // กันผลลัพธ์เก่าทับของใหม่
+let drawing = false;
+let activeDraw = null;
+
+for (let y = 2026; y >= 2014; y--) yearSel.add(new Option(y, y));
+yearSel.value = 2025;
+
+function setStatus(t) { statusEl.textContent = t; }
+
+function setFocus(layer) {
+  if (focus) focus.remove();
+  focus = layer;
+}
+
+function setGraph(open) {
+  document.body.classList.toggle('graph-open', open);
+  btnGraph.classList.toggle('active', open);
+  if (open && chart) setTimeout(() => chart.resize(), 0);
+}
+
+// ---------- ชั้นแผนที่ LST / NDVI ----------
+async function loadTiles() {
+  const y = yearSel.value;
+  setStatus('กำลังโหลดแผนที่...');
+  try {
+    const r = await fetch(`/api/tiles?start=${y}-01-01&end=${y}-12-31`);
+    const d = await r.json();
+    if (!r.ok) { setStatus('ผิดพลาด: ' + d.error); return; }
+
+    [lstLayer, ndviLayer].forEach(l => {
+      if (l) { map.removeLayer(l); layerControl.removeLayer(l); }
+    });
+    lstLayer = L.tileLayer(d.lst, { opacity: 0.7 }).addTo(map);
+    ndviLayer = L.tileLayer(d.ndvi, { opacity: 0.7 });
+    layerControl.addOverlay(lstLayer, 'อุณหภูมิผิวดิน LST (น้ำเงิน=เย็น, แดง=ร้อน)');
+    layerControl.addOverlay(ndviLayer, 'พืชพรรณ NDVI (เขียว=พืชหนาแน่น)');
+    setStatus('');
+  } catch (err) {
+    setStatus('เชื่อมต่อเซิร์ฟเวอร์ไม่ได้');
+  }
+}
+
+// ---------- กราฟ ----------
+function drawChart(rows) {
+  if (chart) chart.destroy();
+  chart = new Chart(document.getElementById('chart'), {
+    type: 'line',
+    data: {
+      labels: rows.map(r => r.date),
+      datasets: [
+        { label: 'LST (°C)', data: rows.map(r => r.LST), borderColor: '#dc2626',
+          yAxisID: 'y', spanGaps: true, tension: 0.2 },
+        { label: 'NDVI', data: rows.map(r => r.NDVI), borderColor: '#16a34a',
+          yAxisID: 'y1', spanGaps: true, tension: 0.2 }
+      ]
+    },
+    options: {
+      maintainAspectRatio: false,
+      scales: {
+        y: { position: 'left', title: { display: true, text: '°C' } },
+        y1: { position: 'right', min: -0.2, max: 1, grid: { drawOnChartArea: false },
+              title: { display: true, text: 'NDVI' } }
+      }
+    }
+  });
+}
+
+async function runSeries(payload, label) {
+  const id = ++reqId;
+  setGraph(true);
+  graphTitle.textContent = label;
+  graphSummary.textContent = 'กำลังดึงข้อมูล... (อาจใช้เวลา 10-60 วินาที)';
+  if (chart) { chart.destroy(); chart = null; }
+  try {
+    const r = await fetch('/api/series', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...payload, start: SERIES_START, end: SERIES_END })
+    });
+    const d = await r.json();
+    if (id !== reqId) return;
+    if (!r.ok) { graphSummary.textContent = 'ผิดพลาด: ' + d.error; return; }
+    if (!d.length) { graphSummary.textContent = 'ไม่มีข้อมูลที่ไม่ติดเมฆในพื้นที่นี้'; return; }
+    drawChart(d);
+    const avg = k => {
+      const v = d.map(row => row[k]).filter(x => x != null);
+      return v.reduce((a, b) => a + b, 0) / v.length;
+    };
+    graphSummary.textContent =
+      `LST เฉลี่ย ${avg('LST').toFixed(1)} °C · NDVI เฉลี่ย ${avg('NDVI').toFixed(2)} · ${d.length} เดือนที่มีข้อมูล (ค่ารายเดือน)`;
+  } catch (err) {
+    if (id === reqId) graphSummary.textContent = 'เชื่อมต่อเซิร์ฟเวอร์ไม่ได้';
+  }
+}
+
+// ---------- โฟกัสแบบที่ 1: คลิกจุด ----------
+map.on('click', e => {
+  if (drawing) return;
+  provSel.value = '';
+  const { lat, lng } = e.latlng;
+  setFocus(L.circleMarker(e.latlng, { radius: 7, color: '#2563eb', fillOpacity: 0.8 }).addTo(map));
+  runSeries({ lat, lon: lng }, `จุด ${lat.toFixed(4)}, ${lng.toFixed(4)}`);
+});
+
+// ---------- โฟกัสแบบที่ 2: วาดพื้นที่ ----------
+function cancelDraw() {
+  if (activeDraw) { activeDraw.disable(); activeDraw = null; }
+}
+
+function startDraw(kind) {
+  cancelDraw();
+  const opts = { shapeOptions: { color: '#2563eb', weight: 2 }, showArea: false };
+  activeDraw = kind === 'rect'
+    ? new L.Draw.Rectangle(map, opts)
+    : new L.Draw.Polygon(map, { ...opts, allowIntersection: false });
+  activeDraw.enable();
+  setStatus(kind === 'rect' ? 'ลากเมาส์เพื่อวาดสี่เหลี่ยม' : 'คลิกเพื่อวางจุด ดับเบิลคลิกเพื่อจบ');
+}
+
+map.on(L.Draw.Event.DRAWSTART, () => { drawing = true; });
+map.on(L.Draw.Event.DRAWSTOP, () => { setTimeout(() => { drawing = false; }, 300); });
+map.on(L.Draw.Event.CREATED, e => {
+  activeDraw = null;
+  provSel.value = '';
+  const layer = e.layer;
+  layer.options.bubblingMouseEvents = false;
+  layer.addTo(map);
+  setFocus(layer);
+  setStatus('');
+  runSeries({ geometry: layer.toGeoJSON().geometry }, 'พื้นที่ที่วาด');
+});
+
+document.getElementById('btnPoly').onclick = () => startDraw('poly');
+document.getElementById('btnRect').onclick = () => startDraw('rect');
+
+// ---------- โฟกัสแบบที่ 3: เลือกจังหวัด ----------
+fetch('/api/provinces').then(r => r.json()).then(list => {
+  if (Array.isArray(list)) list.forEach(n => provSel.add(new Option(n, n)));
+}).catch(() => setStatus('โหลดรายชื่อจังหวัดไม่ได้'));
+
+provSel.addEventListener('change', async () => {
+  const name = provSel.value;
+  if (!name) return;
+  cancelDraw();
+  setFocus(null);
+  runSeries({ province: name }, 'จังหวัด ' + name);   // เริ่มดึงกราฟทันที
+  try {
+    const r = await fetch('/api/province_shape?name=' + encodeURIComponent(name));
+    const g = await r.json();
+    if (!r.ok) throw new Error(g.error);
+    if (provSel.value !== name) return;
+    const layer = L.geoJSON(g, {
+      interactive: false,
+      style: { color: '#2563eb', weight: 2, fillOpacity: 0.05 }
+    }).addTo(map);
+    setFocus(layer);
+    map.fitBounds(layer.getBounds());
+  } catch (err) {
+    setStatus('โหลดขอบเขตจังหวัดไม่ได้');
+  }
+});
+
+// ---------- ปุ่มอื่น ๆ ----------
+document.getElementById('btnClear').onclick = () => {
+  cancelDraw();
+  setFocus(null);
+  provSel.value = '';
+  reqId++;
+  if (chart) { chart.destroy(); chart = null; }
+  graphTitle.textContent = 'กราฟ';
+  graphSummary.textContent = 'คลิกแผนที่ วาดพื้นที่ หรือเลือกจังหวัดเพื่อดูกราฟ';
+  setStatus('');
+};
+btnGraph.onclick = () => setGraph(!document.body.classList.contains('graph-open'));
+document.getElementById('graphClose').onclick = () => setGraph(false);
+yearSel.addEventListener('change', loadTiles);
+
+loadTiles();
+</script>
+</body>
+</html>
